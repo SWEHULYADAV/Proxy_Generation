@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import argparse
+import base64
+import hmac
 import json
+import logging
 import random
 import socket
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -15,46 +19,356 @@ import aiohttp
 from aiohttp import web
 import aiohttp_socks
 
-# --- User-Agent Handling ---
-def get_random_user_agent() -> str:
-    """
-    Generates thousands of unique, MODERN user-agents dynamically.
-    This avoids getting blocked by using outdated versions (like Chrome 48) 
-    that some libraries generate.
-    """
-    os_type = random.choice(["windows", "mac", "linux"])
-    
+try:
+    from python_socks.async_.asyncio import Proxy as _SocksProxy
+    _SOCKS_TUNNEL_OK = True
+except ImportError:
+    _SOCKS_TUNNEL_OK = False
+
+logger = logging.getLogger("proxy_api")
+
+# ---------------------------------------------------------------------------
+#  Humanized Browser Fingerprint Engine
+#  Covers every major device category: desktop (Windows/Mac/Linux/Ubuntu),
+#  mobile (Android/iOS), tablet (iPad), Samsung Internet, Edge, Opera.
+#  Each profile emits a CONSISTENT set of headers that match the UA string —
+#  Sec-CH-UA-Mobile, platform, accept-encoding, DNT, etc. are all coherent.
+# ---------------------------------------------------------------------------
+
+_ACCEPT_LANGUAGES = [
+    "en-US,en;q=0.9", "en-GB,en;q=0.9", "en-CA,en;q=0.9", "en-AU,en;q=0.9",
+    "en-US,en;q=0.9,es;q=0.8", "en-US,en;q=0.9,fr;q=0.8",
+    "en-US,en;q=0.9,de;q=0.8", "en-US,en;q=0.8,zh-CN;q=0.6",
+    "en-US,en;q=0.9,pt;q=0.8", "en-IN,en-GB;q=0.9,en;q=0.8",
+    "en-US,en;q=0.9,ja;q=0.7", "en-US,en;q=0.9,ko;q=0.7",
+    "en-ZA,en;q=0.9", "en-PH,en;q=0.9", "en-NG,en;q=0.8",
+]
+
+_CHROME_ACCEPT    = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+_FIREFOX_ACCEPT   = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+_SAFARI_ACCEPT    = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+_EDGE_ACCEPT      = "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.9"
+
+# Desktop OS strings
+_WIN_OS   = ["Windows NT 10.0; Win64; x64", "Windows NT 10.0; WOW64", "Windows NT 11.0; Win64; x64"]
+_MAC_OS   = ["10_15_7", "11_6_8", "12_6_9", "13_5_2", "13_6_4", "14_2_1", "14_4_1", "14_5", "14_6_1", "15_0"]
+_LNX_OS   = ["X11; Linux x86_64", "X11; Ubuntu; Linux x86_64", "X11; Fedora; Linux x86_64",
+             "X11; Linux i686", "X11; CrOS x86_64 15117.111.0"]
+
+# Mobile OS strings
+_ANDROID_VER = ["10", "11", "12", "13", "14", "15"]
+_ANDROID_MODELS = [
+    "Pixel 6", "Pixel 7", "Pixel 8", "Pixel 8 Pro", "Pixel 9",
+    "SM-G991B", "SM-S901B", "SM-S921B", "SM-A546B", "SM-A336B",
+    "motorola edge 40", "motorola moto g84", "OnePlus 12", "OnePlus Nord 3",
+    "POCO F5", "Redmi Note 12 Pro", "Xiaomi 13", "Xiaomi 14 Pro",
+    "vivo V29", "OPPO Reno10 Pro", "realme GT 5", "Nokia G60",
+]
+_IOS_VER    = ["16_6_1", "17_0", "17_1_1", "17_2", "17_3_1", "17_4", "17_5", "17_6", "18_0", "18_1"]
+_IPHONE_MDL = ["iPhone14,2", "iPhone14,3", "iPhone15,2", "iPhone15,3", "iPhone16,1", "iPhone16,2"]
+_IPAD_MDL   = ["iPad13,4", "iPad13,18", "iPad14,1", "iPad14,5", "iPad16,3"]
+
+# Browser versions
+_CHROME_VER  = list(range(116, 137))
+_FIREFOX_VER = list(range(115, 135))
+_EDGE_VER    = list(range(110, 130))
+_SAMSUNG_VER = ["23.0", "24.0", "25.0", "26.0"]
+_OPERA_VER   = ["106", "107", "108", "109", "110"]
+_SAFARI_WK   = [f"605.1.{i}" for i in range(10, 16)]
+_SAFARI_VER  = ["16.6", "17.0", "17.1", "17.2", "17.3", "17.4", "17.5", "18.0", "18.1", "18.2"]
+
+
+def _not_brand(major: int) -> str:
+    return f'"Not_A Brand";v="8", "Chromium";v="{major}", "Google Chrome";v="{major}"'
+
+
+def _not_brand_edge(major: int) -> str:
+    return f'"Not A;Brand";v="99", "Chromium";v="{major}", "Microsoft Edge";v="{major}"'
+
+
+def _not_brand_samsung(major_str: str) -> str:
+    chrome_approx = 120
+    return f'"Not_A Brand";v="8", "Chromium";v="{chrome_approx}", "Samsung Internet";v="{major_str}"'
+
+
+def _build_desktop_chrome() -> Dict[str, str]:
+    os_type = random.choices(["windows", "mac", "linux"], weights=[65, 25, 10], k=1)[0]
     if os_type == "windows":
-        os_str = "Windows NT 10.0; Win64; x64"
+        os_str, platform = random.choice(_WIN_OS), "Windows"
     elif os_type == "mac":
-        mac_vers = ["10_15_7", "11_6", "12_5", "13_4", "14_0", "14_3", "14_4"]
-        os_str = f"Macintosh; Intel Mac OS X {random.choice(mac_vers)}"
+        os_str, platform = f"Macintosh; Intel Mac OS X {random.choice(_MAC_OS)}", "macOS"
     else:
-        os_str = "X11; Linux x86_64"
+        os_str, platform = random.choice(_LNX_OS), "Linux"
+    major = random.choice(_CHROME_VER)
+    build = random.randint(4000, 9999)
+    patch = random.randint(0, 250)
+    ua = f"Mozilla/5.0 ({os_str}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.{build}.{patch} Safari/537.36"
+    return {
+        "User-Agent": ua,
+        "Accept": _CHROME_ACCEPT,
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Sec-CH-UA": _not_brand(major),
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": f'"{platform}"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": random.choice(["none", "same-origin"]),
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Cache-Control": random.choice(["max-age=0", "no-cache"]),
+        "Connection": "keep-alive",
+        "Priority": "u=0, i",
+    }
 
-    browser = random.choices(["chrome", "firefox", "safari"], weights=[60, 20, 20], k=1)[0]
 
-    if browser == "chrome":
-        # Chrome 115-136 (current as of 2025)
-        major = random.randint(115, 136)
-        minor = random.randint(0, 9999)
-        patch = random.randint(0, 210)
-        return f"Mozilla/5.0 ({os_str}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.{minor}.{patch} Safari/537.36"
+def _build_desktop_firefox() -> Dict[str, str]:
+    os_type = random.choices(["windows", "mac", "linux"], weights=[60, 25, 15], k=1)[0]
+    if os_type == "windows":
+        os_str = random.choice(_WIN_OS)
+    elif os_type == "mac":
+        os_str = f"Macintosh; Intel Mac OS X {random.choice(_MAC_OS).replace('_', '.')}"
+    else:
+        os_str = random.choice(_LNX_OS)
+    major = random.choice(_FIREFOX_VER)
+    minor = random.choice([0, 0, 0, 1, 2])
+    ver = f"{major}.{minor}" if minor else f"{major}.0"
+    ua = f"Mozilla/5.0 ({os_str}; rv:{ver}) Gecko/20100101 Firefox/{ver}"
+    return {
+        "User-Agent": ua,
+        "Accept": _FIREFOX_ACCEPT,
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": random.choice(["none", "same-origin"]),
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+        "DNT": random.choice(["1", "1", "0"]),
+        "TE": "trailers",
+    }
 
-    elif browser == "firefox":
-        # Firefox 115-134 (current as of 2025)
-        major = random.randint(115, 134)
-        minor = random.randint(0, 3)
-        version = f"{major}.{minor}" if minor > 0 else f"{major}.0"
-        return f"Mozilla/5.0 ({os_str}; rv:{version}) Gecko/20100101 Firefox/{version}"
 
-    else:  # Safari
-        if os_type != "mac":
-            os_str = "Macintosh; Intel Mac OS X 14_7"
-        webkit = f"605.1.{random.randint(10, 15)}"
-        version = f"{random.randint(17, 18)}.{random.randint(0, 4)}"
-        return f"Mozilla/5.0 ({os_str}) AppleWebKit/{webkit} (KHTML, like Gecko) Version/{version} Safari/{webkit}"
-# ---------------------------
+def _build_desktop_safari() -> Dict[str, str]:
+    mac_ver = random.choice(_MAC_OS)
+    wk = random.choice(_SAFARI_WK)
+    ver = random.choice(_SAFARI_VER)
+    os_str = f"Macintosh; Intel Mac OS X {mac_ver}"
+    ua = f"Mozilla/5.0 ({os_str}) AppleWebKit/{wk} (KHTML, like Gecko) Version/{ver} Safari/{wk}"
+    return {
+        "User-Agent": ua,
+        "Accept": _SAFARI_ACCEPT,
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Connection": "keep-alive",
+    }
+
+
+def _build_desktop_edge() -> Dict[str, str]:
+    os_str = random.choice(_WIN_OS)
+    major = random.choice(_EDGE_VER)
+    ch_major = major + random.randint(0, 3)
+    build = random.randint(4000, 9999)
+    patch = random.randint(0, 250)
+    ua = (
+        f"Mozilla/5.0 ({os_str}) AppleWebKit/537.36 "
+        f"(KHTML, like Gecko) Chrome/{ch_major}.0.{build}.{patch} Safari/537.36 Edg/{major}.0.{build}.{patch}"
+    )
+    return {
+        "User-Agent": ua,
+        "Accept": _EDGE_ACCEPT,
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Sec-CH-UA": _not_brand_edge(ch_major),
+        "Sec-CH-UA-Mobile": "?0",
+        "Sec-CH-UA-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+    }
+
+
+def _build_mobile_android_chrome() -> Dict[str, str]:
+    android_ver = random.choice(_ANDROID_VER)
+    model = random.choice(_ANDROID_MODELS)
+    major = random.choice(_CHROME_VER)
+    build = random.randint(4000, 9999)
+    patch = random.randint(0, 200)
+    ua = (
+        f"Mozilla/5.0 (Linux; Android {android_ver}; {model}) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{major}.0.{build}.{patch} Mobile Safari/537.36"
+    )
+    return {
+        "User-Agent": ua,
+        "Accept": _CHROME_ACCEPT,
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-CH-UA": _not_brand(major),
+        "Sec-CH-UA-Mobile": "?1",
+        "Sec-CH-UA-Platform": '"Android"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": random.choice(["none", "same-origin"]),
+        "Sec-Fetch-User": "?1",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+        "X-Requested-With": "com.android.browser",
+    }
+
+
+def _build_mobile_ios_safari() -> Dict[str, str]:
+    ios_ver = random.choice(_IOS_VER)
+    iphone = random.choice(_IPHONE_MDL)
+    wk = random.choice(_SAFARI_WK)
+    ver = random.choice(_SAFARI_VER)
+    ios_display = ios_ver.replace("_", " ")
+    ua = (
+        f"Mozilla/5.0 (iPhone; CPU iPhone OS {ios_ver} like Mac OS X) "
+        f"AppleWebKit/{wk} (KHTML, like Gecko) "
+        f"Version/{ver} Mobile/15E148 Safari/{wk}"
+    )
+    return {
+        "User-Agent": ua,
+        "Accept": _SAFARI_ACCEPT,
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Connection": "keep-alive",
+    }
+
+
+def _build_ipad_safari() -> Dict[str, str]:
+    ios_ver = random.choice(_IOS_VER)
+    ipad = random.choice(_IPAD_MDL)
+    wk = random.choice(_SAFARI_WK)
+    ver = random.choice(_SAFARI_VER)
+    ua = (
+        f"Mozilla/5.0 (iPad; CPU OS {ios_ver} like Mac OS X) "
+        f"AppleWebKit/{wk} (KHTML, like Gecko) "
+        f"Version/{ver} Mobile/15E148 Safari/{wk}"
+    )
+    return {
+        "User-Agent": ua,
+        "Accept": _SAFARI_ACCEPT,
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Connection": "keep-alive",
+    }
+
+
+def _build_samsung_internet() -> Dict[str, str]:
+    android_ver = random.choice(_ANDROID_VER)
+    model = random.choice(_ANDROID_MODELS)
+    samsung_ver = random.choice(_SAMSUNG_VER)
+    build = random.randint(4000, 9999)
+    ua = (
+        f"Mozilla/5.0 (Linux; Android {android_ver}; {model}) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"SamsungBrowser/{samsung_ver} Chrome/120.0.{build}.0 Mobile Safari/537.36"
+    )
+    return {
+        "User-Agent": ua,
+        "Accept": _CHROME_ACCEPT,
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-CH-UA": _not_brand_samsung(samsung_ver),
+        "Sec-CH-UA-Mobile": "?1",
+        "Sec-CH-UA-Platform": '"Android"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+    }
+
+
+def _build_mobile_firefox_android() -> Dict[str, str]:
+    android_ver = random.choice(_ANDROID_VER)
+    major = random.choice(_FIREFOX_VER)
+    ver = f"{major}.0"
+    ua = (
+        f"Mozilla/5.0 (Android {android_ver}; Mobile; rv:{ver}) "
+        f"Gecko/{ver} Firefox/{ver}"
+    )
+    return {
+        "User-Agent": ua,
+        "Accept": _FIREFOX_ACCEPT,
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Connection": "keep-alive",
+        "DNT": random.choice(["1", "0"]),
+    }
+
+
+def _build_mobile_opera() -> Dict[str, str]:
+    android_ver = random.choice(_ANDROID_VER)
+    model = random.choice(_ANDROID_MODELS)
+    opera_ver = random.choice(_OPERA_VER)
+    chrome_major = int(opera_ver) + 14
+    build = random.randint(4000, 9999)
+    ua = (
+        f"Mozilla/5.0 (Linux; Android {android_ver}; {model}) "
+        f"AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{chrome_major}.0.{build}.0 Mobile Safari/537.36 OPR/{opera_ver}.0.0.0"
+    )
+    return {
+        "User-Agent": ua,
+        "Accept": _CHROME_ACCEPT,
+        "Accept-Language": random.choice(_ACCEPT_LANGUAGES),
+        "Accept-Encoding": "gzip, deflate, br",
+        "Sec-CH-UA": f'"Chromium";v="{chrome_major}", "Opera Mobile";v="{opera_ver}", "Not;A=Brand";v="99"',
+        "Sec-CH-UA-Mobile": "?1",
+        "Sec-CH-UA-Platform": '"Android"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Upgrade-Insecure-Requests": "1",
+        "Connection": "keep-alive",
+    }
+
+
+# Profile weights: real-world browser market share approximation
+_PROFILES = [
+    (_build_desktop_chrome,         42),
+    (_build_mobile_android_chrome,  22),
+    (_build_mobile_ios_safari,      14),
+    (_build_desktop_edge,            7),
+    (_build_desktop_firefox,         6),
+    (_build_desktop_safari,          4),
+    (_build_samsung_internet,        2),
+    (_build_ipad_safari,             1),
+    (_build_mobile_firefox_android,  1),
+    (_build_mobile_opera,            1),
+]
+_PROFILE_FUNCS, _PROFILE_WEIGHTS = zip(*_PROFILES)
+
+
+def get_random_browser_headers() -> Dict[str, str]:
+    """Return a complete, humanized, device-consistent browser header set."""
+    builder = random.choices(_PROFILE_FUNCS, weights=_PROFILE_WEIGHTS, k=1)[0]
+    return builder()
+
+
+def get_random_user_agent() -> str:
+    """Return just the User-Agent string (backwards-compatible)."""
+    return get_random_browser_headers()["User-Agent"]
+# ---------------------------------------------------------------------------
 
 
 from proxy_core import (
@@ -67,6 +381,35 @@ from proxy_core import (
     to_iso,
     utc_now,
 )
+
+# Status codes that indicate proxy/IP is blocked — auto-rotate to next proxy
+_BLOCKED_STATUS_CODES = {403, 407, 429, 503, 521, 522, 523, 524}
+
+# Strings in response body that signal bot detection / captcha / block pages
+_BLOCK_BODY_MARKERS = (
+    b"captcha", b"CAPTCHA", b"Captcha",
+    b"cf-challenge", b"cf_chl", b"__cf_bm",
+    b"Access Denied", b"access denied",
+    b"Bot Detection", b"bot detection",
+    b"Please verify you are a human",
+    b"checking your browser", b"Checking Your Browser",
+    b"DDoS protection", b"ddos protection",
+    b"You have been blocked", b"you have been blocked",
+    b"Forbidden", b"403 Forbidden",
+    b"rate limit", b"Rate Limit", b"Rate limit",
+    b"Too Many Requests",
+    b"robots.txt", b"automated access",
+)
+
+
+def _is_blocked_response(status: int, body_sample: bytes) -> bool:
+    if status in _BLOCKED_STATUS_CODES:
+        return True
+    for marker in _BLOCK_BODY_MARKERS:
+        if marker in body_sample:
+            return True
+    return False
+
 
 HOP_BY_HOP_HEADERS = {
     "connection",
@@ -86,7 +429,7 @@ def parse_proxy_url(proxy_str: str) -> str:
     proxy_str = proxy_str.strip()
 
     if not proxy_str:
-        return f"http://{proxy_str}"
+        raise ValueError("empty proxy string")
 
     if "://" in proxy_str:
         protocol, rest = proxy_str.split("://", 1)
@@ -124,7 +467,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--host", default="127.0.0.1", help="Bind host for the local API"
     )
     parser.add_argument(
-        "--port", type=int, default=8080, help="Bind port for the local API"
+        "--port", type=int, default=1712, help="Bind port for the local API"
     )
     parser.add_argument(
         "--public-base-url",
@@ -169,8 +512,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--request-concurrency",
         type=int,
-        default=80,
-        help="Concurrent outbound target fetches handled by the API",
+        default=200,
+        help="Concurrent outbound target fetches handled by the API (default: 200 = ~240+ req/min)",
     )
     parser.add_argument(
         "--refresh-delay",
@@ -249,8 +592,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--proxy-delay",
         type=float,
-        default=0.5,
-        help="Delay between proxy attempts in fetch mode (seconds)",
+        default=0.1,
+        help="Delay between proxy attempts in fetch mode (seconds, default: 0.1)",
     )
     parser.add_argument(
         "--rotate-ua",
@@ -271,9 +614,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Try top-ranked proxies in order instead of shuffling",
     )
     parser.add_argument(
+        "--api-key",
+        default="",
+        help="Secret key required in X-API-Key header or ?api_key= query param (empty = no auth)",
+    )
+    parser.add_argument(
+        "--cors-origin",
+        default="*",
+        help="Value for Access-Control-Allow-Origin header (default: *)",
+    )
+    parser.add_argument(
+        "--max-response-mb",
+        type=float,
+        default=10.0,
+        help="Maximum response body size in MB for proxied fetch requests (default: 10)",
+    )
+    parser.add_argument(
+        "--log-requests",
+        action="store_true",
+        default=False,
+        help="Log each API request to stdout",
+    )
+    parser.add_argument(
         "--tunnel-port",
         type=int,
-        default=5226,
+        default=1909,
         help="Port for the standard HTTP proxy tunnel (set 0 to disable)",
     )
     parser.add_argument(
@@ -292,6 +657,19 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=120.0,
         help="Idle timeout for CONNECT tunnel relay in seconds",
+    )
+    parser.add_argument(
+        "--tunnel-api-key",
+        default="",
+        help=(
+            "Optional password for standard proxy auth on the tunnel. "
+            "Use clients with http://proxy:<key>@host:port."
+        ),
+    )
+    parser.add_argument(
+        "--tunnel-auth-user",
+        default="proxy",
+        help="Username expected for tunnel proxy auth when --tunnel-api-key is set",
     )
     return parser
 
@@ -412,8 +790,40 @@ class ProxyAPIService:
         self.harvester: Optional[ProxyHarvester] = None
         self.request_session: Optional[aiohttp.ClientSession] = None
         self.refresh_task: Optional[asyncio.Task] = None
-        # session_id -> last-used proxy URL (sticky-session support)
-        self._sticky_sessions: Dict[str, str] = {}
+        # session_id -> last-used proxy URL (LRU, max 10_000 entries)
+        self._sticky_sessions: OrderedDict[str, str] = OrderedDict()
+        self._sticky_max = 10_000
+        self._last_proxy_used: str = ""
+
+    def _update_sticky(self, session_id: str, proxy: str) -> None:
+        if session_id in self._sticky_sessions:
+            self._sticky_sessions.move_to_end(session_id)
+        self._sticky_sessions[session_id] = proxy
+        while len(self._sticky_sessions) > self._sticky_max:
+            self._sticky_sessions.popitem(last=False)
+
+    def _drop_sticky_proxy(self, proxy: str) -> None:
+        stale_sessions = [
+            session_id
+            for session_id, sticky_proxy in self._sticky_sessions.items()
+            if sticky_proxy == proxy
+        ]
+        for session_id in stale_sessions:
+            self._sticky_sessions.pop(session_id, None)
+
+    def _record_runtime_failure(self, record, error: str, probe_url: str) -> None:
+        if not self.harvester:
+            return
+        record.record_failure(
+            error=error,
+            probe_url=probe_url,
+            max_response_time=self.config.max_response_time,
+        )
+        # Runtime failures are removed from the live rotation immediately.
+        # The background verifier can add the proxy back later if it recovers.
+        self.harvester.active_proxies.discard(record.proxy)
+        self._drop_sticky_proxy(record.proxy)
+        self._write_status_file()
 
     def on_progress(self, payload: Dict[str, Any]) -> None:
         self.progress.update(payload)
@@ -431,7 +841,13 @@ class ProxyAPIService:
             sources=self.sources,
             progress_callback=self.on_progress,
         ).__aenter__()
-        connector = aiohttp.TCPConnector(limit=self.args.request_concurrency, ssl=True)
+        connector = aiohttp.TCPConnector(
+            limit=self.args.request_concurrency,
+            limit_per_host=0,
+            ssl=True,
+            ttl_dns_cache=300,
+            use_dns_cache=True,
+        )
         timeout = aiohttp.ClientTimeout(total=self.args.request_timeout)
         self.request_session = aiohttp.ClientSession(
             connector=connector, timeout=timeout, trust_env=False
@@ -562,6 +978,7 @@ class ProxyAPIService:
         allow_redirects: bool = True,
         session_id: Optional[str] = None,
         min_proxy_interval: float = 0.0,
+        max_response_bytes: int = 10 * 1024 * 1024,
     ) -> Dict[str, Any]:
         if not self.harvester or not self.request_session:
             raise RuntimeError("service not started")
@@ -607,13 +1024,24 @@ class ProxyAPIService:
         else:
             records_to_try = records[:max_attempts]
 
+        if (
+            len(records_to_try) > 1
+            and self._last_proxy_used
+            and records_to_try[0].proxy == self._last_proxy_used
+        ):
+            records_to_try = records_to_try[1:] + records_to_try[:1]
+
         for index, record in enumerate(records_to_try, start=1):
             proxy_url = parse_proxy_url(record.proxy)
 
             headers_for_request = sanitize_outbound_headers(headers or {})
 
             if rotate_ua:
-                headers_for_request["User-Agent"] = get_random_user_agent()
+                # Inject full humanized browser fingerprint; caller headers take priority
+                browser_hdrs = get_random_browser_headers()
+                for hdr_key, hdr_val in browser_hdrs.items():
+                    if hdr_key not in headers_for_request:
+                        headers_for_request[hdr_key] = hdr_val
 
             session = self.request_session
             close_session = False
@@ -639,7 +1067,7 @@ class ProxyAPIService:
                     request_kwargs["proxy"] = proxy_url
 
                 async with session.request(**request_kwargs) as response:
-                    payload_bytes = await response.read()
+                    payload_bytes = await response.content.read(max_response_bytes)
                     attempt = {
                         "attempt": index,
                         "proxy": record.proxy,
@@ -648,6 +1076,18 @@ class ProxyAPIService:
                         "status_code": response.status,
                         "final_url": str(response.url),
                     }
+                    # Auto-detect block pages / rate-limiting and skip to next proxy
+                    if _is_blocked_response(response.status, payload_bytes[:512]):
+                        attempt["error"] = f"blocked: status={response.status}"
+                        attempts.append(attempt)
+                        self._record_runtime_failure(
+                            record,
+                            attempt["error"],
+                            target_url,
+                        )
+                        if proxy_delay > 0:
+                            await asyncio.sleep(proxy_delay)
+                        continue
                     if (
                         expected_status is not None
                         and response.status != expected_status
@@ -656,15 +1096,19 @@ class ProxyAPIService:
                             f"expected {expected_status}, got {response.status}"
                         )
                         attempts.append(attempt)
+                        self._record_runtime_failure(
+                            record,
+                            attempt["error"],
+                            target_url,
+                        )
                         if proxy_delay > 0:
                             await asyncio.sleep(proxy_delay)
                         continue
 
                     record.mark_used()
+                    self._last_proxy_used = record.proxy
                     if session_id:
-                        if len(self._sticky_sessions) > 10_000:
-                            self._sticky_sessions.clear()
-                        self._sticky_sessions[session_id] = record.proxy
+                        self._update_sticky(session_id, record.proxy)
                     return {
                         "ok": True,
                         "proxy": record.proxy,
@@ -682,15 +1126,17 @@ class ProxyAPIService:
                         "body_text": payload_bytes.decode("utf-8", errors="replace"),
                     }
             except Exception as exc:
+                error_name = exc.__class__.__name__
                 attempts.append(
                     {
                         "attempt": index,
                         "proxy": record.proxy,
                         "proxy_url": proxy_url,
                         "score": record.score,
-                        "error": exc.__class__.__name__,
+                        "error": error_name,
                     }
                 )
+                self._record_runtime_failure(record, error_name, target_url)
 
                 if proxy_delay > 0:
                     await asyncio.sleep(proxy_delay)
@@ -745,6 +1191,8 @@ class ProxyTunnel:
         connect_timeout: float = 15.0,
         relay_timeout: float = 120.0,
         rotate_ua: bool = True,
+        auth_user: str = "proxy",
+        auth_key: str = "",
     ):
         self.service = service
         self.host = host
@@ -753,6 +1201,8 @@ class ProxyTunnel:
         self.connect_timeout = connect_timeout
         self.relay_timeout = relay_timeout
         self.rotate_ua = rotate_ua
+        self.auth_user = auth_user
+        self.auth_key = auth_key
         self._server: Optional[asyncio.Server] = None
         self._stats: Dict[str, int] = {
             "total_requests": 0,
@@ -761,6 +1211,7 @@ class ProxyTunnel:
             "successful": 0,
             "failed": 0,
         }
+        self._last_proxy_used: str = ""
 
     @property
     def stats(self) -> Dict[str, int]:
@@ -786,9 +1237,59 @@ class ProxyTunnel:
             return []
         pool = list(records[: self.max_attempts * 2])
         random.shuffle(pool)
+        if len(pool) > 1 and pool[0].proxy == self._last_proxy_used:
+            pool = pool[1:] + pool[:1]
         return pool[: self.max_attempts]
 
     # ---- client entry point ------------------------------------------------
+
+    async def _read_request_headers(
+        self, client_reader: asyncio.StreamReader
+    ) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        while True:
+            line = await asyncio.wait_for(
+                client_reader.readline(), timeout=self.connect_timeout,
+            )
+            if line in (b"\r\n", b"\n", b""):
+                break
+            decoded = line.decode("latin-1", errors="replace").strip()
+            if ":" in decoded:
+                key, value = decoded.split(":", 1)
+                headers[key.strip()] = value.strip()
+        return headers
+
+    def _is_authorized(self, headers: Dict[str, str]) -> bool:
+        if not self.auth_key:
+            return True
+
+        auth_value = ""
+        for key, value in headers.items():
+            if key.lower() == "proxy-authorization":
+                auth_value = value
+                break
+        if not auth_value.lower().startswith("basic "):
+            return False
+
+        try:
+            decoded = base64.b64decode(auth_value.split(None, 1)[1]).decode(
+                "utf-8", errors="replace"
+            )
+        except Exception:
+            return False
+
+        expected = f"{self.auth_user}:{self.auth_key}"
+        return hmac.compare_digest(decoded, expected)
+
+    async def _send_proxy_auth_required(
+        self, client_writer: asyncio.StreamWriter
+    ) -> None:
+        client_writer.write(
+            b'HTTP/1.1 407 Proxy Authentication Required\r\n'
+            b'Proxy-Authenticate: Basic realm="Proxy Generator"\r\n'
+            b'Content-Length: 0\r\n\r\n'
+        )
+        await client_writer.drain()
 
     async def _handle_client(
         self,
@@ -804,14 +1305,22 @@ class ProxyTunnel:
 
             self._stats["total_requests"] += 1
             decoded = first_line.decode("latin-1", errors="replace").strip()
+            headers = await self._read_request_headers(client_reader)
+
+            if not self._is_authorized(headers):
+                await self._send_proxy_auth_required(client_writer)
+                self._stats["failed"] += 1
+                return
 
             if decoded.upper().startswith("CONNECT "):
                 self._stats["connect_requests"] += 1
-                await self._handle_connect(decoded, client_reader, client_writer)
+                await self._handle_connect(
+                    decoded, headers, client_reader, client_writer
+                )
             else:
                 self._stats["http_requests"] += 1
                 await self._handle_plain_http(
-                    decoded, client_reader, client_writer,
+                    decoded, headers, client_reader, client_writer,
                 )
         except Exception:
             pass
@@ -827,6 +1336,7 @@ class ProxyTunnel:
     async def _handle_connect(
         self,
         request_line: str,
+        headers: Dict[str, str],
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
     ) -> None:
@@ -848,14 +1358,6 @@ class ProxyTunnel:
             target_host = target
             target_port = 443
 
-        # Consume remaining request headers
-        while True:
-            line = await asyncio.wait_for(
-                client_reader.readline(), timeout=self.connect_timeout,
-            )
-            if line in (b"\r\n", b"\n", b""):
-                break
-
         proxies = self._pick_proxies()
         if not proxies:
             client_writer.write(b"HTTP/1.1 502 No Proxies Available\r\n\r\n")
@@ -864,19 +1366,44 @@ class ProxyTunnel:
             return
 
         for record in proxies:
-            proxy_url = parse_proxy_url(record.proxy)
-            # CONNECT tunneling only works through HTTP proxies
-            if proxy_url.startswith("socks"):
+            try:
+                proxy_url = parse_proxy_url(record.proxy)
+            except ValueError:
+                self.service._record_runtime_failure(
+                    record,
+                    "invalid_proxy_url",
+                    f"{target_host}:{target_port}",
+                )
                 continue
             try:
-                ok = await self._tunnel_via_http_proxy(
-                    proxy_url, target_host, target_port,
-                    client_reader, client_writer,
-                )
+                if proxy_url.startswith("socks"):
+                    if not _SOCKS_TUNNEL_OK:
+                        continue
+                    ok = await self._tunnel_via_socks_proxy(
+                        proxy_url, target_host, target_port,
+                        client_reader, client_writer,
+                    )
+                else:
+                    ok = await self._tunnel_via_http_proxy(
+                        proxy_url, target_host, target_port,
+                        client_reader, client_writer,
+                    )
                 if ok:
+                    record.mark_used()
+                    self._last_proxy_used = record.proxy
                     self._stats["successful"] += 1
                     return
+                self.service._record_runtime_failure(
+                    record,
+                    "connect_tunnel_failed",
+                    f"{target_host}:{target_port}",
+                )
             except Exception:
+                self.service._record_runtime_failure(
+                    record,
+                    "connect_tunnel_exception",
+                    f"{target_host}:{target_port}",
+                )
                 continue
 
         client_writer.write(b"HTTP/1.1 502 All Proxies Failed\r\n\r\n")
@@ -898,7 +1425,7 @@ class ProxyTunnel:
             p_port = int(p_port_str)
         else:
             p_host = stripped
-            p_port = 8080
+            p_port = 80
 
         up_reader, up_writer = await asyncio.wait_for(
             asyncio.open_connection(p_host, p_port),
@@ -940,6 +1467,29 @@ class ProxyTunnel:
                 up_writer.close()
             except Exception:
                 pass
+            return False
+
+    async def _tunnel_via_socks_proxy(
+        self,
+        proxy_url: str,
+        target_host: str,
+        target_port: int,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> bool:
+        """Open a CONNECT tunnel through a SOCKS4/5 proxy using python-socks."""
+        try:
+            proxy = _SocksProxy.from_url(proxy_url)
+            sock = await asyncio.wait_for(
+                proxy.connect(dest_host=target_host, dest_port=target_port),
+                timeout=self.connect_timeout,
+            )
+            up_reader, up_writer = await asyncio.open_connection(sock=sock)
+            client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await client_writer.drain()
+            await self._relay(client_reader, client_writer, up_reader, up_writer)
+            return True
+        except Exception:
             return False
 
     async def _relay(
@@ -994,6 +1544,7 @@ class ProxyTunnel:
     async def _handle_plain_http(
         self,
         request_line: str,
+        request_headers: Dict[str, str],
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
     ) -> None:
@@ -1012,22 +1563,16 @@ class ProxyTunnel:
             self._stats["failed"] += 1
             return
 
-        headers: Dict[str, str] = {}
         content_length = 0
-        while True:
-            hdr = await asyncio.wait_for(
-                client_reader.readline(), timeout=self.connect_timeout,
-            )
-            if hdr in (b"\r\n", b"\n", b""):
-                break
-            decoded = hdr.decode("latin-1", errors="replace").strip()
-            if ":" in decoded:
-                k, v = decoded.split(":", 1)
-                k, v = k.strip(), v.strip()
-                if k.lower() == "content-length":
-                    content_length = int(v)
-                if k.lower() not in HOP_BY_HOP_HEADERS:
-                    headers[k] = v
+        headers: Dict[str, str] = {}
+        for key, value in request_headers.items():
+            if key.lower() == "content-length":
+                try:
+                    content_length = int(value)
+                except ValueError:
+                    content_length = 0
+            if key.lower() not in HOP_BY_HOP_HEADERS:
+                headers[key] = value
 
         body: Optional[bytes] = None
         if content_length > 0:
@@ -1037,7 +1582,10 @@ class ProxyTunnel:
             )
 
         if self.rotate_ua:
-            headers["User-Agent"] = get_random_user_agent()
+            browser_hdrs = get_random_browser_headers()
+            for hdr_key, hdr_val in browser_hdrs.items():
+                if hdr_key not in headers:
+                    headers[hdr_key] = hdr_val
 
         result = await self.service.fetch_via_proxies(
             target_url=target_url,
@@ -1142,7 +1690,7 @@ async def parse_fetch_request(
         != "false",
         "session_id": request.query.get("session_id") or None,
         "min_proxy_interval": float(request.query.get("min_proxy_interval", "0")),
-        "headers": {key: value for key, value in request.headers.items()},
+        "headers": sanitize_outbound_headers(dict(request.headers)),
         "body": raw_body or None,
     }
 
@@ -1153,6 +1701,48 @@ def json_error(message: str, status: int = 400, **extra: Any) -> web.Response:
     return web.json_response(payload, status=status)
 
 
+@web.middleware
+async def cors_middleware(request: web.Request, handler) -> web.Response:
+    allowed_origin = request.app.get("cors_origin", "*")
+    if request.method == "OPTIONS":
+        return web.Response(
+            status=204,
+            headers={
+                "Access-Control-Allow-Origin": allowed_origin,
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, X-API-Key, Authorization",
+                "Access-Control-Max-Age": "86400",
+            },
+        )
+    response = await handler(request)
+    response.headers["Access-Control-Allow-Origin"] = allowed_origin
+    return response
+
+
+@web.middleware
+async def api_key_middleware(request: web.Request, handler) -> web.Response:
+    api_key = request.app.get("api_key")
+    if not api_key:
+        return await handler(request)
+    # Health check always passes without auth
+    if request.path in ("/health",):
+        return await handler(request)
+    provided = (
+        request.headers.get("X-API-Key")
+        or request.query.get("api_key")
+    )
+    if provided != api_key:
+        return json_error("unauthorized: valid X-API-Key header or ?api_key= required", status=401)
+    return await handler(request)
+
+
+@web.middleware
+async def request_logging_middleware(request: web.Request, handler) -> web.Response:
+    response = await handler(request)
+    logger.info("%s %s -> %s", request.method, request.path, response.status)
+    return response
+
+
 async def handle_status(request: web.Request) -> web.Response:
     service: ProxyAPIService = request.app["service"]
     include_proxies = request.query.get("include_proxies", "false").lower() == "true"
@@ -1160,6 +1750,19 @@ async def handle_status(request: web.Request) -> web.Response:
     return web.json_response(
         service.status_payload(include_proxies=include_proxies, limit=limit)
     )
+
+
+async def handle_reload(request: web.Request) -> web.Response:
+    """POST /reload — force immediate proxy pool refresh."""
+    service: ProxyAPIService = request.app["service"]
+    summary = await service.refresh_once(force_collect=True, force_verify=True)
+    return web.json_response({
+        "ok": True,
+        "message": "pool refresh triggered",
+        "active_proxies": summary.get("active_proxies", 0),
+        "added": summary.get("added_active", 0),
+        "removed": summary.get("removed_active", 0),
+    })
 
 
 async def handle_tunnel_status(request: web.Request) -> web.Response:
@@ -1375,8 +1978,19 @@ async def handle_proxy_raw(request: web.Request) -> web.Response:
 
 async def create_app(args: argparse.Namespace) -> web.Application:
     service = ProxyAPIService(args)
-    app = web.Application(client_max_size=20 * 1024 * 1024)
+
+    middlewares = [cors_middleware, api_key_middleware]
+    if getattr(args, "log_requests", False):
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+        middlewares.append(request_logging_middleware)
+
+    app = web.Application(
+        client_max_size=20 * 1024 * 1024,
+        middlewares=middlewares,
+    )
     app["service"] = service
+    app["api_key"] = getattr(args, "api_key", "") or None
+    app["cors_origin"] = getattr(args, "cors_origin", "*")
 
     async def on_startup(app: web.Application) -> None:
         await app["service"].start()
@@ -1395,6 +2009,7 @@ async def create_app(args: argparse.Namespace) -> web.Application:
     app.router.add_get("/stats", handle_stats)
     app.router.add_route("*", "/proxy", handle_proxy_raw)
     app.router.add_route("*", "/fetch", handle_fetch_json)
+    app.router.add_post("/reload", handle_reload)
     app.router.add_get("/tunnel-status", handle_tunnel_status)
     return app
 
@@ -1414,6 +2029,8 @@ async def run_server(args: argparse.Namespace) -> None:
             max_attempts=getattr(args, "tunnel_max_attempts", 5),
             relay_timeout=getattr(args, "tunnel_relay_timeout", 120.0),
             rotate_ua=getattr(args, "rotate_ua", True),
+            auth_user=getattr(args, "tunnel_auth_user", "proxy"),
+            auth_key=getattr(args, "tunnel_api_key", ""),
         )
         app["tunnel"] = tunnel
 
@@ -1422,6 +2039,7 @@ async def run_server(args: argparse.Namespace) -> None:
     site = web.TCPSite(runner, host=args.host, port=args.port)
     access_urls = build_access_urls(args.host, args.port, args.public_base_url)
 
+    api_key = getattr(args, "api_key", "") or None
     print("\n" + "=" * 60)
     print("  PROXY API SERVICE")
     print("=" * 60)
@@ -1434,6 +2052,10 @@ async def run_server(args: argparse.Namespace) -> None:
         or access_urls.get("local")
         or f"http://{args.host}:{args.port}"
     )
+    if api_key:
+        print(f"\n  Auth: X-API-Key: {api_key}  (or ?api_key={api_key})")
+    else:
+        print("\n  Auth: DISABLED (use --api-key to enable)")
     print("\nAPI Endpoints:")
     print(f"  GET  {preferred_url}/status")
     print(f"  GET  {preferred_url}/stats                  -- pool breakdown by protocol/country/anonymity")
@@ -1442,7 +2064,17 @@ async def run_server(args: argparse.Namespace) -> None:
     print(f"  GET  {preferred_url}/random                 -- random proxy from pool (?protocol= &country= &anonymity=)")
     print(f"  GET  {preferred_url}/proxy?url=https://example.com  -- fetch URL through rotating proxy")
     print(f"  POST {preferred_url}/fetch                  -- JSON body: {{url, method, headers, session_id, ...}}")
+    print(f"  POST {preferred_url}/reload                 -- force immediate pool refresh")
     print(f"  GET  {preferred_url}/tunnel-status")
+    if tunnel_port > 0:
+        tunnel_auth_key = getattr(args, "tunnel_api_key", "") or ""
+        auth_user = getattr(args, "tunnel_auth_user", "proxy")
+        if tunnel_auth_key:
+            print(
+                f"\nProxy Tunnel: http://{auth_user}:<tunnel-api-key>@{tunnel_host}:{tunnel_port}"
+            )
+        else:
+            print(f"\nProxy Tunnel: http://{tunnel_host}:{tunnel_port}")
 
     if tunnel:
         await tunnel.start()

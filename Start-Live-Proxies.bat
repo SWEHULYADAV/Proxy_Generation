@@ -2,11 +2,24 @@
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
+set "CONFIG_FILE=proxy-service-config.env"
+
+if exist "%CONFIG_FILE%" (
+  for /f "usebackq tokens=1,* delims==" %%A in ("%CONFIG_FILE%") do set "%%A=%%B"
+)
+
 if /I "%~1"=="__child" goto child_entry
 
 set "MODE=%~1"
 if /I "%MODE%"=="live" goto launch_live_only
 if /I "%MODE%"=="api" goto launch_api_only
+
+if not exist "%CONFIG_FILE%" (
+  echo Missing %CONFIG_FILE%
+  echo Run Setup-Authenticated-Proxy-Service.bat first.
+  pause
+  exit /b 1
+)
 
 echo Starting both services...
 start "Proxy Generator Live" cmd /k ""%~f0" __child live"
@@ -65,7 +78,18 @@ exit /b 0
 title Proxy Generator API
 echo Starting local proxy API...
 echo.
-venv\Scripts\python.exe -u Proxy-api.py --host 0.0.0.0 --tunnel-host 0.0.0.0 --output-root "%~dp0output" !FORWARD_ARGS!
+set "API_ARGS=--host 127.0.0.1 --tunnel-host 127.0.0.1"
+
+if defined PROXY_SERVICE_API_PORT set "API_ARGS=!API_ARGS! --port %PROXY_SERVICE_API_PORT%"
+if defined PROXY_SERVICE_TUNNEL_PORT set "API_ARGS=!API_ARGS! --tunnel-port %PROXY_SERVICE_TUNNEL_PORT%"
+if defined PROXY_SERVICE_API_KEY set "API_ARGS=!API_ARGS! --api-key %PROXY_SERVICE_API_KEY%"
+if defined PROXY_SERVICE_TUNNEL_KEY set "API_ARGS=!API_ARGS! --tunnel-api-key %PROXY_SERVICE_TUNNEL_KEY%"
+if defined PROXY_SERVICE_TUNNEL_USER set "API_ARGS=!API_ARGS! --tunnel-auth-user %PROXY_SERVICE_TUNNEL_USER%"
+if defined PROXY_SERVICE_OUTPUT_ROOT set "API_ARGS=!API_ARGS! --output-root %PROXY_SERVICE_OUTPUT_ROOT%"
+if /I "%PROXY_SERVICE_WARMUP%"=="1" set "API_ARGS=!API_ARGS! --warmup"
+if /I "%PROXY_SERVICE_LOG_REQUESTS%"=="1" set "API_ARGS=!API_ARGS! --log-requests"
+
+venv\Scripts\python.exe -u Proxy-api.py !API_ARGS! !FORWARD_ARGS!
 echo.
 echo Proxy API stopped.
 pause

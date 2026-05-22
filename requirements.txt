@@ -1,4 +1,8 @@
 aiohttp
 aiohttp-socks
+python-socks
 requests
 rich
+cloakbrowser[geoip]
+camoufox[geoip]
+playwright

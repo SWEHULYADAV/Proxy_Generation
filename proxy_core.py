@@ -24,6 +24,12 @@ from typing import (
 
 import aiohttp
 
+try:
+    import aiohttp_socks
+    _SOCKS_OK = True
+except ImportError:
+    _SOCKS_OK = False
+
 DEFAULT_OUTPUT_FILE = "active_proxies.json"
 DEFAULT_USER_AGENT = "ProxyGenerator/2.0 (+local pool manager)"
 DEFAULT_TEST_URLS = (
@@ -67,15 +73,47 @@ DEFAULT_SOURCES = (
     "https://raw.githubusercontent.com/casals-ar/proxy-list/main/http",
     "https://raw.githubusercontent.com/rxvl-d/ProxyList/main/results.txt",
     "https://raw.githubusercontent.com/UptimerBot/proxy-list/main/proxies/http.txt",
+    # --- Fresh/high-update sources (every 5-30 min) ---
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/http.txt",
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/https.txt",
+    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
+    "https://raw.githubusercontent.com/rx443/proxy-list/online/online/http.txt",
+    "https://raw.githubusercontent.com/TuanMinPay/live-proxy/master/http.txt",
+    "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
+    "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/main/http.txt",
+    "https://raw.githubusercontent.com/proxylist-to/proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies_anonymous/http.txt",
+    "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/http.txt",
+    "https://raw.githubusercontent.com/hanwayTech/free-proxy-list/main/http.txt",
+    "https://raw.githubusercontent.com/hanwayTech/free-proxy-list/main/https.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/http.txt",
+    "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
+    "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/https.txt",
+    # --- ProxyScrape API (multiple protocols) ---
+    "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=http&timeout=10000&country=all&anonymity=all",
+    "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks5&timeout=10000",
+    "https://api.proxyscrape.com/v3/free-proxy-list/get?request=displayproxies&protocol=socks4&timeout=10000",
     # --- SOCKS5 sources ---
     "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
     "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks5.txt",
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks5.txt",
+    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
+    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt",
+    "https://raw.githubusercontent.com/ObcbO/getproxy/master/file/socks5.txt",
     # --- SOCKS4 sources ---
     "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
     "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
     "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks4.txt",
+    "https://raw.githubusercontent.com/vakhov/fresh-proxy-list/master/socks4.txt",
+    "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks4.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks4.txt",
+    "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks4.txt",
     # --- APIs that return JSON (regex still extracts IP:port) ---
     "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&filterUpTime=90&protocols=http",
     "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&filterUpTime=90&protocols=socks5",
@@ -89,7 +127,7 @@ PROXY_WITH_AUTH_PATTERN = re.compile(
 # Enrichment endpoints
 ANONYMITY_CHECK_URL = "http://httpbin.org/headers"
 GEO_API_URL = "http://ip-api.com/json/{ip}?fields=status,countryCode"
-_GEO_ENRICH_CONCURRENCY = 8
+_GEO_ENRICH_CONCURRENCY = 5  # ip-api.com free tier: 45 req/min
 _ANONYMITY_ENRICH_CONCURRENCY = 15
 _ENRICH_BATCH_SIZE = 25
 
@@ -270,18 +308,39 @@ def _extract_ip(proxy_url: str) -> str:
         return ""
 
 
+async def _check_anonymity_via_socks(proxy_url: str, timeout_seconds: float) -> str:
+    if not _SOCKS_OK:
+        return ""
+    try:
+        connector = aiohttp_socks.ProxyConnector.from_url(proxy_url, ssl=False)
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        async with aiohttp.ClientSession(connector=connector, trust_env=False) as s:
+            async with s.get(
+                ANONYMITY_CHECK_URL,
+                timeout=timeout,
+                headers={"User-Agent": DEFAULT_USER_AGENT},
+            ) as response:
+                if response.status != 200:
+                    return ""
+                data = await response.json(content_type=None)
+                received = {k.lower(): v for k, v in data.get("headers", {}).items()}
+                if "x-forwarded-for" in received or "x-real-ip" in received:
+                    return "transparent"
+                if "via" in received or "proxy-connection" in received:
+                    return "anonymous"
+                return "elite"
+    except Exception:
+        return ""
+
+
 async def check_proxy_anonymity(
     session: aiohttp.ClientSession,
     proxy_url: str,
     timeout_seconds: float = 8.0,
 ) -> str:
-    """Return 'elite', 'anonymous', 'transparent', or '' on failure.
-
-    Hits httpbin.org/headers through the proxy and inspects which headers
-    the server received.  Elite proxies don't forward any identifying headers.
-    """
+    """Return 'elite', 'anonymous', 'transparent', or '' on failure."""
     if proxy_url.startswith("socks"):
-        return ""  # aiohttp core can't SOCKS-proxy without aiohttp_socks connector
+        return await _check_anonymity_via_socks(proxy_url, timeout_seconds)
     try:
         timeout = aiohttp.ClientTimeout(total=timeout_seconds)
         async with session.get(
@@ -600,6 +659,52 @@ class ProbeOutcome:
     status_code: int = 0
 
 
+async def _probe_socks_proxy(
+    proxy: str,
+    proxy_url: str,
+    test_urls: Sequence[str],
+    timeout_seconds: float,
+    user_agent: str,
+) -> ProbeOutcome:
+    if not _SOCKS_OK:
+        return ProbeOutcome(proxy=proxy, working=False, error="aiohttp_socks not installed")
+    headers = {"User-Agent": user_agent, "Accept": "application/json,text/plain,*/*"}
+    errors: List[str] = []
+    try:
+        connector = aiohttp_socks.ProxyConnector.from_url(proxy_url, ssl=False)
+        async with aiohttp.ClientSession(connector=connector, trust_env=False) as socks_session:
+            for test_url in test_urls:
+                started = time.perf_counter()
+                try:
+                    timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+                    async with socks_session.get(
+                        test_url, headers=headers, timeout=timeout, allow_redirects=True,
+                    ) as response:
+                        body = await response.text()
+                        if response.status != 200:
+                            errors.append(f"{response.status} from {test_url}")
+                            continue
+                        origin = _extract_origin(body)
+                        if not origin:
+                            errors.append(f"no origin from {test_url}")
+                            continue
+                        return ProbeOutcome(
+                            proxy=proxy, working=True,
+                            response_time=time.perf_counter() - started,
+                            probe_url=test_url, origin=origin, status_code=response.status,
+                        )
+                except asyncio.TimeoutError:
+                    errors.append(f"timeout from {test_url}")
+                except Exception as exc:
+                    errors.append(f"{exc.__class__.__name__} from {test_url}")
+    except Exception as exc:
+        errors.append(f"connector: {exc.__class__.__name__}")
+    return ProbeOutcome(
+        proxy=proxy, working=False,
+        error="; ".join(errors[:3]) if errors else "unknown error",
+    )
+
+
 async def probe_proxy(
     session: aiohttp.ClientSession,
     proxy: str,
@@ -610,6 +715,9 @@ async def probe_proxy(
     headers = {"User-Agent": user_agent, "Accept": "application/json,text/plain,*/*"}
     proxy_url = proxy if "://" in proxy else f"http://{proxy}"
     errors: List[str] = []
+
+    if proxy_url.startswith(("socks4://", "socks5://")):
+        return await _probe_socks_proxy(proxy, proxy_url, test_urls, timeout_seconds, user_agent)
 
     for test_url in test_urls:
         started = time.perf_counter()
@@ -798,6 +906,8 @@ class ProxyHarvester:
                 if not record.country:
                     ip = _extract_ip(proxy_url)
                     async with sem_geo:
+                        # Small delay to stay within ip-api.com free rate limit (45/min)
+                        await asyncio.sleep(0.15)
                         country = await lookup_proxy_country(
                             self.session,  # type: ignore[arg-type]
                             ip,
@@ -839,27 +949,45 @@ class ProxyHarvester:
         )
         self._last_save = now
 
-    async def _fetch_source(self, url: str) -> Set[str]:
+    async def _fetch_source(self, url: str, retries: int = 2) -> Set[str]:
         if not self.session:
             raise RuntimeError("harvester session is not ready")
 
-        try:
-            timeout = aiohttp.ClientTimeout(total=self.config.fetch_timeout)
-            async with self.session.get(
-                url, timeout=timeout, allow_redirects=True
-            ) as response:
-                if response.status != 200:
-                    self.source_counts[url] = 0
-                    self.source_errors[url] = f"http {response.status}"
-                    return set()
-                proxies = extract_proxies(await response.text())
-                self.source_counts[url] = len(proxies)
-                self.source_errors[url] = ""
-                return proxies
-        except Exception as exc:
-            self.source_counts[url] = 0
-            self.source_errors[url] = exc.__class__.__name__
-            return set()
+        last_error = ""
+        for attempt in range(retries + 1):
+            try:
+                timeout = aiohttp.ClientTimeout(total=self.config.fetch_timeout)
+                async with self.session.get(
+                    url, timeout=timeout, allow_redirects=True
+                ) as response:
+                    if response.status == 429:
+                        self.source_counts[url] = 0
+                        self.source_errors[url] = "rate_limited"
+                        return set()
+                    if response.status != 200:
+                        last_error = f"http {response.status}"
+                        if attempt < retries:
+                            await asyncio.sleep(1.0 * (attempt + 1))
+                            continue
+                        self.source_counts[url] = 0
+                        self.source_errors[url] = last_error
+                        return set()
+                    proxies = extract_proxies(await response.text())
+                    self.source_counts[url] = len(proxies)
+                    self.source_errors[url] = ""
+                    return proxies
+            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                last_error = exc.__class__.__name__
+                if attempt < retries:
+                    await asyncio.sleep(0.5 * (attempt + 1))
+            except Exception as exc:
+                self.source_counts[url] = 0
+                self.source_errors[url] = exc.__class__.__name__
+                return set()
+
+        self.source_counts[url] = 0
+        self.source_errors[url] = last_error
+        return set()
 
     async def collect_candidates(self) -> Dict[str, Set[str]]:
         candidate_sources: DefaultDict[str, Set[str]] = defaultdict(set)
