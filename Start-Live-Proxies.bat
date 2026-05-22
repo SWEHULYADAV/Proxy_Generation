@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableDelayedExpansion
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 set "CONFIG_FILE=proxy-service-config.env"
@@ -80,13 +80,17 @@ echo Starting local proxy API...
 echo.
 set "API_ARGS=--host 127.0.0.1 --tunnel-host 127.0.0.1"
 
-if defined PROXY_SERVICE_API_PORT set "API_ARGS=!API_ARGS! --port %PROXY_SERVICE_API_PORT%"
+if defined PROXY_SERVICE_API_PORT    set "API_ARGS=!API_ARGS! --port %PROXY_SERVICE_API_PORT%"
 if defined PROXY_SERVICE_TUNNEL_PORT set "API_ARGS=!API_ARGS! --tunnel-port %PROXY_SERVICE_TUNNEL_PORT%"
-if defined PROXY_SERVICE_API_KEY set "API_ARGS=!API_ARGS! --api-key %PROXY_SERVICE_API_KEY%"
-if defined PROXY_SERVICE_TUNNEL_KEY set "API_ARGS=!API_ARGS! --tunnel-api-key %PROXY_SERVICE_TUNNEL_KEY%"
+rem C-2: Keys are passed via environment variables (PROXY_SERVICE_API_KEY,
+rem      PROXY_SERVICE_TUNNEL_KEY) which Python reads as argparse defaults.
+rem      This prevents keys from appearing in the Windows process list / task manager.
 if defined PROXY_SERVICE_TUNNEL_USER set "API_ARGS=!API_ARGS! --tunnel-auth-user %PROXY_SERVICE_TUNNEL_USER%"
 if defined PROXY_SERVICE_OUTPUT_ROOT set "API_ARGS=!API_ARGS! --output-root %PROXY_SERVICE_OUTPUT_ROOT%"
-if /I "%PROXY_SERVICE_WARMUP%"=="1" set "API_ARGS=!API_ARGS! --warmup"
+rem L-6: warmup is ON by default. Set PROXY_SERVICE_WARMUP=0 in config to disable.
+if /I "%PROXY_SERVICE_WARMUP%"=="0" goto skip_warmup
+set "API_ARGS=!API_ARGS! --warmup"
+:skip_warmup
 if /I "%PROXY_SERVICE_LOG_REQUESTS%"=="1" set "API_ARGS=!API_ARGS! --log-requests"
 
 venv\Scripts\python.exe -u Proxy-api.py !API_ARGS! !FORWARD_ARGS!

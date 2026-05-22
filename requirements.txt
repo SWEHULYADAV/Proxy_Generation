@@ -1,18 +1,14 @@
-# Install packages with:
+# Core packages — install with:
 #   venv\Scripts\pip install -r requirements.txt
-#
-# Browser binaries are handled by Setup-Authenticated-Proxy-Service.bat
-# after package install. If you want to run them manually:
-#   venv\Scripts\python -m cloakbrowser install
-#   venv\Scripts\python -m camoufox fetch
-#   venv\Scripts\playwright install chromium
-
 
 aiohttp
 aiohttp-socks
 python-socks
 requests
 rich
-cloakbrowser[geoip]
-camoufox[geoip]
-playwright
+
+# Optional browser-helper packages live in requirements-browser.txt (NOT needed for the API service):
+#   venv\Scripts\pip install -r requirements-browser.txt
+#   venv\Scripts\python -m cloakbrowser install
+#   venv\Scripts\python -m camoufox fetch
+#   venv\Scripts\playwright install chromium

@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableDelayedExpansion
+setlocal EnableExtensions EnableDelayedExpansion
 cd /d "%~dp0"
 
 set "CONFIG_FILE=proxy-service-config.env"
@@ -114,9 +114,9 @@ echo Setup complete for Rahul Yadav (SWEHUL Yadav).
 echo.
 echo REST API:    http://!PROXY_SERVICE_HOST!:!PROXY_SERVICE_API_PORT!
 echo Proxy URL:   http://!PROXY_SERVICE_HOST!:!PROXY_SERVICE_TUNNEL_PORT!
-echo API Key:     !PROXY_SERVICE_API_KEY!
+echo API Key:     !PROXY_SERVICE_API_KEY:~0,4!********************************  (full key in %CONFIG_FILE%)
 echo Tunnel User: !PROXY_SERVICE_TUNNEL_USER!
-echo Tunnel Key:  !PROXY_SERVICE_TUNNEL_KEY!
+echo Tunnel Key:  !PROXY_SERVICE_TUNNEL_KEY:~0,4!********************************  (full key in %CONFIG_FILE%)
 echo.
 echo Saved config file: %~dp0%CONFIG_FILE%
 echo.

@@ -168,6 +168,8 @@ cd "C:\Users\Admin\Desktop\Proxy Generator"
 python -m venv venv
 ```
 
+Requires Python 3.11 or newer.
+
 ### 3. Install Python dependencies
 
 ```bat
@@ -177,6 +179,7 @@ venv\Scripts\pip install -r requirements.txt
 If you want the optional browser helper to work fully, also run:
 
 ```bat
+venv\Scripts\pip install -r requirements-browser.txt
 venv\Scripts\python -m cloakbrowser install
 venv\Scripts\python -m camoufox fetch
 venv\Scripts\playwright install chromium
@@ -205,19 +208,22 @@ After that, your normal daily launcher becomes:
 Start-Live-Proxies.bat
 ```
 
-Installed Python packages:
+Installed core Python packages:
 
 - `aiohttp`
 - `aiohttp-socks`
 - `python-socks`
 - `requests`
 - `rich`
+
+Optional browser-helper packages:
+
 - `cloakbrowser[geoip]`
 - `camoufox[geoip]`
 - `playwright`
 
-The proxy service itself mainly relies on the networking stack.
-The browser packages are included so the optional browser helper can be enabled from the same environment.
+The proxy service itself relies only on the core networking stack.
+The browser packages are optional and only needed for `stealth_browser.py`.
 
 ## Launch Modes
 
@@ -254,13 +260,13 @@ Start-Live-Proxies.bat live
 ### Option 4. Run the Python service directly
 
 ```bat
-venv\Scripts\python Proxy-api.py
+venv\Scripts\python Proxy-api.py --api-key MY_API_KEY --tunnel-api-key MY_PROXY_KEY
 ```
 
 ### Option 5. Warmup mode
 
 ```bat
-venv\Scripts\python Proxy-api.py --warmup
+venv\Scripts\python Proxy-api.py --warmup --api-key MY_API_KEY --tunnel-api-key MY_PROXY_KEY
 ```
 
 `--warmup` means the service waits for one full pool build before becoming available.
@@ -271,7 +277,7 @@ This is useful when you want the pool ready before your app starts sending traff
 For normal local use:
 
 ```bat
-venv\Scripts\python Proxy-api.py --warmup --log-requests
+venv\Scripts\python Proxy-api.py --warmup --log-requests --api-key MY_API_KEY --tunnel-api-key MY_PROXY_KEY
 ```
 
 For protected local use:
@@ -1007,7 +1013,7 @@ Most important flags for [Proxy-api.py](</c:/Users/Admin/Desktop/Proxy Generator
 | `--proxy-delay` | `0.1` | delay between proxy attempts |
 | `--rotate-ua` | on | rotate HTTP headers and user-agent |
 | `--no-shuffle-proxies` | off | preserve rank order instead of shuffling |
-| `--api-key` | empty | REST API auth key |
+| `--api-key` | required | REST API auth key |
 | `--cors-origin` | `*` | CORS allow origin |
 | `--max-response-mb` | `10.0` | max response size |
 | `--log-requests` | off | request logging |
@@ -1015,7 +1021,7 @@ Most important flags for [Proxy-api.py](</c:/Users/Admin/Desktop/Proxy Generator
 | `--tunnel-port` | `1909` | tunnel port |
 | `--tunnel-max-attempts` | `5` | attempts per tunnel request |
 | `--tunnel-relay-timeout` | `120.0` | tunnel idle timeout |
-| `--tunnel-api-key` | empty | standard proxy auth password |
+| `--tunnel-api-key` | required when tunnel is enabled | standard proxy auth password |
 | `--tunnel-auth-user` | `proxy` | standard proxy auth username |
 
 ## Startup Checklist

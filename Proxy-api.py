@@ -5,6 +5,7 @@ import asyncio
 import argparse
 import base64
 import hmac
+import ipaddress
 import json
 import logging
 import random
@@ -579,7 +580,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe-url",
         action="append",
         dest="probe_urls",
-        help="Override/add HTTP probe URL",
+        help="Override/add probe URL",
     )
     parser.add_argument(
         "--source-file", help="Optional file with extra source URLs, one per line"
@@ -615,8 +616,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--api-key",
-        default="",
-        help="Secret key required in X-API-Key header or ?api_key= query param (empty = no auth)",
+        default=os.environ.get("PROXY_SERVICE_API_KEY", ""),
+        help=(
+            "Secret key required in X-API-Key request header. "
+            "Can also be set via PROXY_SERVICE_API_KEY env var "
+            "(preferred — avoids key appearing in process list)."
+        ),
     )
     parser.add_argument(
         "--cors-origin",
@@ -660,9 +665,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--tunnel-api-key",
-        default="",
+        default=os.environ.get("PROXY_SERVICE_TUNNEL_KEY", ""),
         help=(
-            "Optional password for standard proxy auth on the tunnel. "
+            "Password for standard proxy auth on the tunnel. "
+            "Can also be set via PROXY_SERVICE_TUNNEL_KEY env var "
+            "(preferred — avoids key appearing in process list). "
             "Use clients with http://proxy:<key>@host:port."
         ),
     )
@@ -767,12 +774,51 @@ def sanitize_inbound_response_headers(
     return cleaned
 
 
-def is_valid_target_url(value: str) -> bool:
+def _is_public_ip_address(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_global
+    except ValueError:
+        return False
+
+
+async def is_public_target_host(hostname: str) -> bool:
+    normalized = hostname.strip().rstrip(".").lower()
+    if not normalized:
+        return False
+    if normalized == "localhost" or normalized.endswith(".localhost"):
+        return False
+    if _is_public_ip_address(normalized):
+        return True
+    try:
+        ipaddress.ip_address(normalized)
+    except ValueError:
+        pass
+    else:
+        return False
+
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            normalized,
+            None,
+            type=socket.SOCK_STREAM,
+        )
+    except OSError:
+        return False
+
+    resolved_ips = {info[4][0] for info in infos if info[4]}
+    if not resolved_ips:
+        return False
+    return all(_is_public_ip_address(ip) for ip in resolved_ips)
+
+
+async def is_valid_target_url(value: str) -> bool:
     try:
         parsed = urlparse(value)
     except Exception:
         return False
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return False
+    return await is_public_target_host(parsed.hostname)
 
 
 class ProxyAPIService:
@@ -794,6 +840,8 @@ class ProxyAPIService:
         self._sticky_sessions: OrderedDict[str, str] = OrderedDict()
         self._sticky_max = 10_000
         self._last_proxy_used: str = ""
+        self._last_status_write: float = 0.0   # M-6: debounce status file writes
+        self._last_reload_at: float = 0.0       # M-7: rate-limit /reload
 
     def _update_sticky(self, session_id: str, proxy: str) -> None:
         if session_id in self._sticky_sessions:
@@ -823,7 +871,11 @@ class ProxyAPIService:
         # The background verifier can add the proxy back later if it recovers.
         self.harvester.active_proxies.discard(record.proxy)
         self._drop_sticky_proxy(record.proxy)
-        self._write_status_file()
+        # M-6: Debounce — write at most once every 2 seconds to prevent disk thrash
+        now = time.monotonic()
+        if now - self._last_status_write >= 2.0:
+            self._write_status_file()
+            self._last_status_write = now
 
     def on_progress(self, payload: Dict[str, Any]) -> None:
         self.progress.update(payload)
@@ -963,6 +1015,10 @@ class ProxyAPIService:
             ]
         return payload
 
+    _ALLOWED_METHODS: frozenset = frozenset(
+        {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+    )
+
     async def fetch_via_proxies(
         self,
         *,
@@ -973,15 +1029,34 @@ class ProxyAPIService:
         timeout: Optional[float] = None,
         max_attempts: int = 10,
         expected_status: Optional[int] = None,
+        expected_statuses: Optional[List[int]] = None,
         pool_limit: int = 50,
         min_score: float = 0.0,
         allow_redirects: bool = True,
         session_id: Optional[str] = None,
         min_proxy_interval: float = 0.0,
         max_response_bytes: int = 10 * 1024 * 1024,
+        detect_block_pages: bool = True,
     ) -> Dict[str, Any]:
         if not self.harvester or not self.request_session:
             raise RuntimeError("service not started")
+
+        # --- HTTP method allowlist ------------------------------------------
+        method = method.upper()
+        if method not in self._ALLOWED_METHODS:
+            return {
+                "ok": False,
+                "error": f"unsupported method: {method}",
+                "allowed_methods": sorted(self._ALLOWED_METHODS),
+                "attempts": [],
+            }
+
+        # --- Merge expected_status / expected_statuses into a set -----------
+        _expected: set = set()
+        if expected_statuses:
+            _expected.update(int(s) for s in expected_statuses)
+        if expected_status is not None:
+            _expected.add(int(expected_status))
 
         await self.ensure_ready()
         records = self.ranked_records(limit=pool_limit, min_score=min_score)
@@ -992,6 +1067,10 @@ class ProxyAPIService:
             return {
                 "ok": False,
                 "error": "no active proxies available",
+                "retry_after_seconds": 10,
+                "active_proxies": 0,
+                "known_records": len(self.harvester.records) if self.harvester else 0,
+                "hint": "wait for /status active_proxies > 0 or POST /reload",
                 "attempts": [],
             }
 
@@ -1067,7 +1146,9 @@ class ProxyAPIService:
                     request_kwargs["proxy"] = proxy_url
 
                 async with session.request(**request_kwargs) as response:
-                    payload_bytes = await response.content.read(max_response_bytes)
+                    payload_bytes = await response.content.read(max_response_bytes + 1)
+                    truncated = len(payload_bytes) > max_response_bytes
+                    payload_bytes = payload_bytes[:max_response_bytes]
                     attempt = {
                         "attempt": index,
                         "proxy": record.proxy,
@@ -1077,7 +1158,7 @@ class ProxyAPIService:
                         "final_url": str(response.url),
                     }
                     # Auto-detect block pages / rate-limiting and skip to next proxy
-                    if _is_blocked_response(response.status, payload_bytes[:512]):
+                    if detect_block_pages and _is_blocked_response(response.status, payload_bytes[:512]):
                         attempt["error"] = f"blocked: status={response.status}"
                         attempts.append(attempt)
                         self._record_runtime_failure(
@@ -1088,12 +1169,9 @@ class ProxyAPIService:
                         if proxy_delay > 0:
                             await asyncio.sleep(proxy_delay)
                         continue
-                    if (
-                        expected_status is not None
-                        and response.status != expected_status
-                    ):
+                    if _expected and response.status not in _expected:
                         attempt["error"] = (
-                            f"expected {expected_status}, got {response.status}"
+                            f"expected {sorted(_expected)}, got {response.status}"
                         )
                         attempts.append(attempt)
                         self._record_runtime_failure(
@@ -1109,6 +1187,15 @@ class ProxyAPIService:
                     self._last_proxy_used = record.proxy
                     if session_id:
                         self._update_sticky(session_id, record.proxy)
+
+                    # Binary vs text detection for body encoding
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    is_text_response = any(
+                        content_type.startswith(prefix)
+                        for prefix in ("text/", "application/json", "application/xml",
+                                       "application/javascript", "application/x-www-form-urlencoded")
+                    )
+
                     return {
                         "ok": True,
                         "proxy": record.proxy,
@@ -1123,7 +1210,11 @@ class ProxyAPIService:
                         "final_url": str(response.url),
                         "headers": dict(response.headers),
                         "body_bytes": payload_bytes,
-                        "body_text": payload_bytes.decode("utf-8", errors="replace"),
+                        "body_text": payload_bytes.decode("utf-8", errors="replace") if is_text_response else None,
+                        "body_base64": base64.b64encode(payload_bytes).decode("ascii") if not is_text_response else None,
+                        "body_encoding": "text" if is_text_response else "base64",
+                        "truncated": truncated,
+                        "max_response_bytes": max_response_bytes,
                     }
             except Exception as exc:
                 error_name = exc.__class__.__name__
@@ -1358,6 +1449,12 @@ class ProxyTunnel:
             target_host = target
             target_port = 443
 
+        if not await is_public_target_host(target_host):
+            client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            await client_writer.drain()
+            self._stats["failed"] += 1
+            return
+
         proxies = self._pick_proxies()
         if not proxies:
             client_writer.write(b"HTTP/1.1 502 No Proxies Available\r\n\r\n")
@@ -1557,8 +1654,8 @@ class ProxyTunnel:
             return
 
         method, target_url = parts[0], parts[1]
-        if not is_valid_target_url(target_url):
-            client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+        if not await is_valid_target_url(target_url):
+            client_writer.write(b"HTTP/1.1 403 Forbidden\r\n\r\n")
             await client_writer.drain()
             self._stats["failed"] += 1
             return
@@ -1629,6 +1726,9 @@ async def parse_fetch_request(
     request: web.Request, *, default_method: Optional[str] = None
 ) -> Dict[str, Any]:
     if request.method == "GET":
+        # Parse expected_statuses from comma-separated query param e.g. ?expected_statuses=200,301,302
+        _es_raw = request.query.get("expected_statuses", "")
+        _expected_statuses = [int(s) for s in _es_raw.split(",") if s.strip().isdigit()] or None
         return {
             "url": request.query.get("url", "").strip(),
             "method": request.query.get("method", default_method or "GET"),
@@ -1637,15 +1737,27 @@ async def parse_fetch_request(
             "expected_status": int(request.query["expected_status"])
             if "expected_status" in request.query
             else None,
+            "expected_statuses": _expected_statuses,
             "pool_limit": int(request.query.get("pool_limit", "50")),
             "min_score": float(request.query.get("min_score", "0")),
             "allow_redirects": request.query.get("allow_redirects", "true").lower()
             != "false",
             "session_id": request.query.get("session_id") or None,
             "min_proxy_interval": float(request.query.get("min_proxy_interval", "0")),
+            "detect_block_pages": request.query.get("detect_block_pages", "true").lower() != "false",
             "headers": {},
             "body": None,
         }
+    # L-3: Reject unsupported Content-Types explicitly so multipart/form-data
+    # and other unexpected formats don't silently fall through to the raw-body branch.
+    _SUPPORTED_CONTENT_TYPES = {
+        "application/json", "application/x-www-form-urlencoded", "",
+    }
+    if request.method == "POST" and request.content_type not in _SUPPORTED_CONTENT_TYPES:
+        raise web.HTTPUnsupportedMediaType(
+            reason=f"Unsupported Content-Type '{request.content_type}'. "
+                   f"Use application/json or application/x-www-form-urlencoded."
+        )
 
     if request.content_type == "application/json":
         payload = await request.json()
@@ -1656,6 +1768,14 @@ async def parse_fetch_request(
             body_bytes = None
         else:
             body_bytes = json.dumps(body_value).encode("utf-8")
+
+        # expected_statuses: accept list or single value
+        raw_es = payload.get("expected_statuses")
+        if raw_es is not None:
+            expected_statuses_val: Optional[List[int]] = [int(s) for s in (raw_es if isinstance(raw_es, list) else [raw_es])]
+        else:
+            expected_statuses_val = None
+
         return {
             "url": str(payload.get("url", "")).strip(),
             "method": str(payload.get("method", default_method or request.method)),
@@ -1664,11 +1784,13 @@ async def parse_fetch_request(
             "expected_status": int(payload["expected_status"])
             if payload.get("expected_status") is not None
             else None,
+            "expected_statuses": expected_statuses_val,
             "pool_limit": int(payload.get("pool_limit", 50)),
             "min_score": float(payload.get("min_score", 0)),
             "allow_redirects": bool(payload.get("allow_redirects", True)),
             "session_id": str(payload["session_id"]) if payload.get("session_id") else None,
             "min_proxy_interval": float(payload.get("min_proxy_interval", 0)),
+            "detect_block_pages": bool(payload.get("detect_block_pages", True)),
             "headers": {
                 str(k): str(v) for k, v in dict(payload.get("headers", {})).items()
             },
@@ -1701,6 +1823,10 @@ def json_error(message: str, status: int = 400, **extra: Any) -> web.Response:
     return web.json_response(payload, status=status)
 
 
+_CORS_ALLOW_METHODS = "GET, POST, PUT, DELETE, PATCH, OPTIONS"
+_CORS_ALLOW_HEADERS = "Content-Type, X-API-Key, Authorization"
+
+
 @web.middleware
 async def cors_middleware(request: web.Request, handler) -> web.Response:
     allowed_origin = request.app.get("cors_origin", "*")
@@ -1709,13 +1835,19 @@ async def cors_middleware(request: web.Request, handler) -> web.Response:
             status=204,
             headers={
                 "Access-Control-Allow-Origin": allowed_origin,
-                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, X-API-Key, Authorization",
+                "Access-Control-Allow-Methods": _CORS_ALLOW_METHODS,
+                "Access-Control-Allow-Headers": _CORS_ALLOW_HEADERS,
                 "Access-Control-Max-Age": "86400",
             },
         )
     response = await handler(request)
     response.headers["Access-Control-Allow-Origin"] = allowed_origin
+    response.headers["Access-Control-Allow-Methods"] = _CORS_ALLOW_METHODS
+    response.headers["Access-Control-Allow-Headers"] = _CORS_ALLOW_HEADERS
+    # L-5: credentialed requests (fetch with credentials:'include') need this
+    # header when origin is not the wildcard *
+    if allowed_origin != "*":
+        response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
 
 
@@ -1727,12 +1859,15 @@ async def api_key_middleware(request: web.Request, handler) -> web.Response:
     # Health check always passes without auth
     if request.path in ("/health",):
         return await handler(request)
-    provided = (
-        request.headers.get("X-API-Key")
-        or request.query.get("api_key")
-    )
-    if provided != api_key:
-        return json_error("unauthorized: valid X-API-Key header or ?api_key= required", status=401)
+    # Only accept key via X-API-Key header — NOT via query param to prevent key leakage
+    # in logs, browser history, proxy logs, and screenshots.
+    provided = request.headers.get("X-API-Key", "")
+    if not hmac.compare_digest(provided, api_key):
+        return json_error(
+            "unauthorized: X-API-Key header required",
+            status=401,
+            hint="Pass your key as: -H 'X-API-Key: YOUR_KEY'",
+        )
     return await handler(request)
 
 
@@ -1753,8 +1888,19 @@ async def handle_status(request: web.Request) -> web.Response:
 
 
 async def handle_reload(request: web.Request) -> web.Response:
-    """POST /reload — force immediate proxy pool refresh."""
+    """POST /reload — force immediate proxy pool refresh (rate-limited to once per 60 s)."""
     service: ProxyAPIService = request.app["service"]
+    # M-7: rate limit — full refresh cycle is expensive (30-90 sec, CPU + network)
+    now = time.monotonic()
+    cooldown = 60.0
+    elapsed = now - service._last_reload_at
+    if elapsed < cooldown:
+        return json_error(
+            f"reload too frequent — try again in {int(cooldown - elapsed)} seconds",
+            status=429,
+            retry_after=int(cooldown - elapsed),
+        )
+    service._last_reload_at = now
     summary = await service.refresh_once(force_collect=True, force_verify=True)
     return web.json_response({
         "ok": True,
@@ -1905,8 +2051,11 @@ async def handle_fetch_json(request: web.Request) -> web.Response:
     service: ProxyAPIService = request.app["service"]
     options = await parse_fetch_request(request)
     target_url = options["url"]
-    if not is_valid_target_url(target_url):
-        return json_error("valid http/https url is required", status=400)
+    if not await is_valid_target_url(target_url):
+        return json_error(
+            "target URL must use http/https and resolve only to public IP addresses",
+            status=403,
+        )
 
     result = await service.fetch_via_proxies(
         target_url=target_url,
@@ -1916,11 +2065,13 @@ async def handle_fetch_json(request: web.Request) -> web.Response:
         timeout=options["timeout"],
         max_attempts=options["max_attempts"],
         expected_status=options["expected_status"],
+        expected_statuses=options.get("expected_statuses"),
         pool_limit=options["pool_limit"],
         min_score=options["min_score"],
         allow_redirects=options["allow_redirects"],
         session_id=options.get("session_id"),
         min_proxy_interval=options.get("min_proxy_interval", 0.0),
+        detect_block_pages=options.get("detect_block_pages", True),
     )
     if not result["ok"]:
         return web.json_response(result, status=502)
@@ -1937,6 +2088,9 @@ async def handle_fetch_json(request: web.Request) -> web.Response:
         "final_url": result["final_url"],
         "headers": result["headers"],
         "body": result["body_text"],
+        "body_base64": result.get("body_base64"),
+        "truncated": result.get("truncated", False),
+        "max_response_bytes": result.get("max_response_bytes"),
         "attempts": result["attempts"],
     }
     return web.json_response(payload)
@@ -1946,8 +2100,11 @@ async def handle_proxy_raw(request: web.Request) -> web.Response:
     service: ProxyAPIService = request.app["service"]
     options = await parse_fetch_request(request, default_method=request.method)
     target_url = options["url"]
-    if not is_valid_target_url(target_url):
-        return json_error("valid http/https url is required", status=400)
+    if not await is_valid_target_url(target_url):
+        return json_error(
+            "target URL must use http/https and resolve only to public IP addresses",
+            status=403,
+        )
 
     result = await service.fetch_via_proxies(
         target_url=target_url,
@@ -1957,11 +2114,13 @@ async def handle_proxy_raw(request: web.Request) -> web.Response:
         timeout=options["timeout"],
         max_attempts=options["max_attempts"],
         expected_status=options["expected_status"],
+        expected_statuses=options.get("expected_statuses"),
         pool_limit=options["pool_limit"],
         min_score=options["min_score"],
         allow_redirects=options["allow_redirects"],
         session_id=options.get("session_id"),
         min_proxy_interval=options.get("min_proxy_interval", 0.0),
+        detect_block_pages=options.get("detect_block_pages", True),
     )
     if not result["ok"]:
         return web.json_response(result, status=502)
@@ -1971,6 +2130,9 @@ async def handle_proxy_raw(request: web.Request) -> web.Response:
     headers["X-Proxy-Score"] = str(result["proxy_score"])
     headers["X-Proxy-Attempts"] = str(len(result["attempts"]))
     headers["X-Final-URL"] = result["final_url"]
+    if result.get("truncated"):
+        headers["X-Truncated"] = "true"
+        headers["X-Max-Response-Bytes"] = str(result.get("max_response_bytes", ""))
     return web.Response(
         status=result["status_code"], body=result["body_bytes"], headers=headers
     )
@@ -2014,7 +2176,23 @@ async def create_app(args: argparse.Namespace) -> web.Application:
     return app
 
 
+def ensure_secure_runtime_args(args: argparse.Namespace) -> argparse.Namespace:
+    args.api_key = (getattr(args, "api_key", "") or "").strip()
+    if not args.api_key:
+        raise SystemExit(
+            "ERROR: --api-key is required. Run Setup-Authenticated-Proxy-Service.bat first."
+        )
+    args.tunnel_api_key = (getattr(args, "tunnel_api_key", "") or "").strip()
+    if getattr(args, "tunnel_port", 0) > 0 and not args.tunnel_api_key:
+        raise SystemExit(
+            "ERROR: --tunnel-api-key is required when the tunnel is enabled. "
+            "Run Setup-Authenticated-Proxy-Service.bat first."
+        )
+    return args
+
+
 async def run_server(args: argparse.Namespace) -> None:
+    args = ensure_secure_runtime_args(args)
     app = await create_app(args)
     tunnel: Optional[ProxyTunnel] = None
     tunnel_port = getattr(args, "tunnel_port", 0)
@@ -2053,7 +2231,7 @@ async def run_server(args: argparse.Namespace) -> None:
         or f"http://{args.host}:{args.port}"
     )
     if api_key:
-        print(f"\n  Auth: X-API-Key: {api_key}  (or ?api_key={api_key})")
+        print(f"\n  Auth: X-API-Key: {api_key}  (header only — query param not accepted)")
     else:
         print("\n  Auth: DISABLED (use --api-key to enable)")
     print("\nAPI Endpoints:")
@@ -2106,6 +2284,7 @@ async def run_server(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    args = ensure_secure_runtime_args(args)
     try:
         run_async_entrypoint(run_server(args))
     except KeyboardInterrupt:

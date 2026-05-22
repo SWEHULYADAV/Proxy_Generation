@@ -173,7 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe-url",
         action="append",
         dest="probe_urls",
-        help="Override/add HTTP probe URL",
+        help="Override/add probe URL",
     )
     parser.add_argument(
         "--source-file", help="Optional file with extra source URLs, one per line"
@@ -238,10 +238,13 @@ def configure_windows_console() -> None:
 
 
 def clear_screen() -> None:
+    # M-8: ANSI escape for flicker-free in-place update.
+    # Works on Windows 10+ Terminal, ConEmu, VS Code terminal.
+    # Falls back to cls only when ANSI is not supported.
     if os.name == "nt":
-        os.system("cls")
-        return
-    console.clear()
+        print("\033[H\033[J", end="", flush=True)
+    else:
+        console.clear()
 
 
 def flush_console() -> None:
@@ -491,17 +494,25 @@ async def run_live_window(args: argparse.Namespace) -> None:
     async with ProxyHarvester(
         config=config, sources=sources, progress_callback=progress_callback
     ) as harvester:
-        while True:
-            summary = await harvester.run_cycle()
-            records = filter_records(
-                harvester, limit=args.limit, min_score=args.min_score
-            )
-            export_live_outputs(records, args, summary)
-            write_session_info(args, summary, sources)
-            render_table(records, summary, args)
-            if args.once:
-                return
-            await asyncio.sleep(args.refresh_delay)
+        try:
+            while True:
+                summary = await harvester.run_cycle()
+                records = filter_records(
+                    harvester, limit=args.limit, min_score=args.min_score
+                )
+                export_live_outputs(records, args, summary)
+                write_session_info(args, summary, sources)
+                render_table(records, summary, args)
+                if args.once:
+                    return
+                await asyncio.sleep(args.refresh_delay)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            # H-4: Ensure pool is flushed to disk even on abrupt exit
+            try:
+                await harvester.save_pool(force=True)
+            except Exception:
+                pass
+            raise
 
 
 def main() -> None:

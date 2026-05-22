@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import signal
 import sys
 import time
 from collections import defaultdict
@@ -33,7 +34,8 @@ except ImportError:
 DEFAULT_OUTPUT_FILE = "active_proxies.json"
 DEFAULT_USER_AGENT = "ProxyGenerator/2.0 (+local pool manager)"
 DEFAULT_TEST_URLS = (
-    "http://httpbin.org/ip",
+    "https://api.ipify.org?format=json",
+    "https://httpbin.org/ip",
     "http://api.ipify.org?format=json",
 )
 DEFAULT_SOURCES = (
@@ -127,7 +129,8 @@ PROXY_WITH_AUTH_PATTERN = re.compile(
 # Enrichment endpoints
 ANONYMITY_CHECK_URL = "http://httpbin.org/headers"
 GEO_API_URL = "http://ip-api.com/json/{ip}?fields=status,countryCode"
-_GEO_ENRICH_CONCURRENCY = 5  # ip-api.com free tier: 45 req/min
+_GEO_ENRICH_CONCURRENCY = 1
+_GEO_DELAY_SECONDS = 1.4  # ~42 req/min to stay below ip-api.com free limits
 _ANONYMITY_ENRICH_CONCURRENCY = 15
 _ENRICH_BATCH_SIZE = 25
 
@@ -139,13 +142,11 @@ def normalize_proxy(candidate: str) -> Optional[str]:
 
     protocol = "http"
     if "://" in value:
-        parts = value.split("://", 1)
-        protocol = parts[0].lower()
-        if protocol not in ("http", "https", "socks4", "socks5"):
-            protocol = "http"
-            value = parts[1]
-        else:
-            value = parts[1]
+        scheme, rest = value.split("://", 1)
+        scheme = scheme.lower()
+        if scheme in ("http", "https", "socks4", "socks5"):
+            protocol = scheme
+        value = rest
 
     if "@" in value:
         value = value.split("@", 1)[1]
@@ -210,7 +211,7 @@ def run_async_with_cleanup(coro, cleanup_callback=None):
             interrupt_event.set()
 
         if sys.platform != "win32":
-            for sig in (asyncio.signals.SIGINT, asyncio.signals.SIGTERM):
+            for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, signal_handler)
 
         async def run_coro():
@@ -237,7 +238,7 @@ def utc_now() -> datetime:
 
 
 def to_iso(value: datetime) -> str:
-    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def parse_datetime(value: str | None) -> datetime:
@@ -760,6 +761,15 @@ async def probe_proxy(
     )
 
 
+def _write_json_atomic(output_path: str, tmp_path: str, payload: dict) -> None:
+    """Write JSON to a temp file then atomically replace the target. Thread-safe."""
+    from pathlib import Path as _Path
+    t = _Path(tmp_path)
+    t.parent.mkdir(parents=True, exist_ok=True)
+    t.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    t.replace(_Path(output_path))
+
+
 class ProxyHarvester:
     def __init__(
         self,
@@ -906,8 +916,7 @@ class ProxyHarvester:
                 if not record.country:
                     ip = _extract_ip(proxy_url)
                     async with sem_geo:
-                        # Small delay to stay within ip-api.com free rate limit (45/min)
-                        await asyncio.sleep(0.15)
+                        await asyncio.sleep(_GEO_DELAY_SECONDS)
                         country = await lookup_proxy_country(
                             self.session,  # type: ignore[arg-type]
                             ip,
@@ -920,7 +929,8 @@ class ProxyHarvester:
 
         await asyncio.gather(*(enrich(record) for record in candidates))
 
-    def save_pool(self, force: bool = False) -> None:
+    async def save_pool(self, force: bool = False) -> None:
+        """Persist the active proxy pool to disk without blocking the event loop."""
         now = time.monotonic()
         if not force and (now - self._last_save) < self.config.auto_save_interval:
             return
@@ -944,8 +954,11 @@ class ProxyHarvester:
             ],
             "proxies": [record.to_dict() for record in self.ranked_active_records()],
         }
-        Path(self.config.output_file).write_text(
-            json.dumps(payload, indent=2), encoding="utf-8"
+        output_path = Path(self.config.output_file)
+        tmp_path = output_path.with_suffix(f"{output_path.suffix}.tmp")
+        # H-1: Use asyncio.to_thread so disk I/O never blocks the event loop.
+        await asyncio.to_thread(
+            _write_json_atomic, str(output_path), str(tmp_path), payload
         )
         self._last_save = now
 
@@ -1001,14 +1014,19 @@ class ProxyHarvester:
             collected_candidates=0,
         )
 
+        # M-2: Limit concurrent source fetches to avoid port exhaustion on
+        # slow connections. Reuse the same max_concurrent cap as verification.
+        source_sem = asyncio.Semaphore(self.config.max_concurrent)
+
         async def worker(url: str) -> None:
             nonlocal completed_sources
-            try:
-                result = await self._fetch_source(url)
-            except Exception as exc:
-                self.source_counts[url] = 0
-                self.source_errors[url] = exc.__class__.__name__
-                result = set()
+            async with source_sem:
+                try:
+                    result = await self._fetch_source(url)
+                except Exception as exc:
+                    self.source_counts[url] = 0
+                    self.source_errors[url] = exc.__class__.__name__
+                    result = set()
 
             for proxy in result:
                 candidate_sources[proxy].add(url)
@@ -1158,7 +1176,9 @@ class ProxyHarvester:
             if proxy in self.active_proxies:
                 continue
             age = (utc_now() - record.last_checked).total_seconds()
-            if record.successful_checks == 0 and record.total_checks >= 2:
+            # M-1: Require at least 5 checks before permanently pruning a proxy.
+            # Free proxies are unstable — 2 failures is too aggressive a threshold.
+            if record.successful_checks == 0 and record.total_checks >= 5:
                 remove.append(proxy)
             elif (
                 age >= stale_seconds
@@ -1239,7 +1259,7 @@ class ProxyHarvester:
             summary["best_score"] = best.score
             summary["best_response_time"] = best.avg_response_time
 
-        self.save_pool()
+        await self.save_pool()
         self._emit_progress(
             phase="cycle_complete",
             active_now=summary["active_proxies"],

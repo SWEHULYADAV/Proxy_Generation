@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe-url",
         action="append",
         dest="probe_urls",
-        help="Override/add HTTP probe URL",
+        help="Override/add probe URL",
     )
     parser.add_argument(
         "--source-file", help="Optional file with extra source URLs, one per line"
@@ -210,7 +210,7 @@ async def run_harvester(args: argparse.Namespace) -> None:
 
         if args.once:
             summary = await harvester.run_cycle(force_collect=True, force_verify=True)
-            harvester.save_pool(force=True)
+            await harvester.save_pool(force=True)
             print_cycle_summary(summary, harvester)
             return
 

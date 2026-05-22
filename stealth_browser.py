@@ -228,9 +228,10 @@ _STEALTH_JS = r"""
     const _origMeasureText = CanvasRenderingContext2D.prototype.measureText;
     CanvasRenderingContext2D.prototype.measureText = function(text) {
         const result = _origMeasureText.call(this, text);
+        const originalWidth = result.width;
         const noise  = (Math.random() - 0.5) * 0.00001;
         Object.defineProperty(result, 'width', {
-            get: () => result.width + noise,
+            get: () => originalWidth + noise,
             configurable: true,
         });
         return result;
@@ -267,17 +268,24 @@ _STEALTH_JS = r"""
     } catch(_) {}
 
     // ── 8. navigator.hardwareConcurrency & deviceMemory ──────────────────
+    // M-4/M-5 FIX: pick values ONCE at init time — consistent on every access.
+    // Re-randomising on each .get() call is detectable by sites that read
+    // these properties multiple times and check for consistency.
     const _cores = [2, 4, 4, 4, 6, 8, 8, 8, 12, 16];
     const _mems  = [2, 4, 4, 8, 8, 8, 16];
+    const _pickedCores = _cores[Math.floor(Math.random() * _cores.length)];
+    const _pickedMem   = _mems[Math.floor(Math.random() * _mems.length)];
     try {
         Object.defineProperty(navigator, 'hardwareConcurrency', {
-            get: () => _cores[Math.floor(Math.random() * _cores.length)],
+            get: () => _pickedCores,
+            configurable: true,
         });
     } catch(_) {}
     try {
         if ('deviceMemory' in navigator) {
             Object.defineProperty(navigator, 'deviceMemory', {
-                get: () => _mems[Math.floor(Math.random() * _mems.length)],
+                get: () => _pickedMem,
+                configurable: true,
             });
         }
     } catch(_) {}
@@ -557,6 +565,7 @@ async def _scrape_playwright(
     timeout: int,
     wait_extra_ms: int,
     screenshot: Optional[str],
+    ignore_https_errors: bool,
 ) -> Dict[str, Any]:
     vp = random.choice(_MOBILE_VIEWPORTS if mobile else _DESKTOP_VIEWPORTS)
     timezone = random.choice(_TIMEZONES)
@@ -589,7 +598,7 @@ async def _scrape_playwright(
                 "locale": locale,
                 "timezone_id": timezone,
                 "accept_downloads": True,
-                "ignore_https_errors": True,
+                "ignore_https_errors": ignore_https_errors,
                 "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
             }
             if mobile:
@@ -638,6 +647,7 @@ async def scrape_url(
     wait_extra_ms: int = 0,
     screenshot: Optional[str] = None,
     engine: str = "auto",
+    ignore_https_errors: bool = False,
 ) -> Dict[str, Any]:
     """
     Scrape *url* with full anti-detection.
@@ -673,7 +683,14 @@ async def scrape_url(
                 errors[candidate] = "not installed"
                 continue
             result = await _scrape_playwright(
-                url, proxy_url, headless, mobile, timeout, wait_extra_ms, screenshot
+                url,
+                proxy_url,
+                headless,
+                mobile,
+                timeout,
+                wait_extra_ms,
+                screenshot,
+                ignore_https_errors,
             )
         else:
             errors[candidate] = "unknown engine"
@@ -689,7 +706,7 @@ async def scrape_url(
         "ok": False,
         "error": (
             "No browser engine available. Install one:\n"
-            "  pip install -r requirements.txt\n"
+            "  pip install -r requirements-browser.txt\n"
             "  python -m cloakbrowser install\n"
             "  python -m camoufox fetch\n"
             "  playwright install chromium"
@@ -728,6 +745,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mobile", action="store_true", help="Use mobile device profile")
     p.add_argument("--timeout", type=int, default=30_000, help="Page load timeout in ms")
     p.add_argument("--wait", type=int, default=0, help="Extra wait after page load (ms)")
+    p.add_argument(
+        "--ignore-https-errors",
+        action="store_true",
+        help="Allow browser sessions to continue despite TLS certificate errors",
+    )
     p.add_argument("--screenshot", help="Save screenshot to this path")
     p.add_argument("--output", help="Save HTML content to this file")
     p.add_argument(
@@ -741,14 +763,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _print_engine_status() -> None:
     print("Engine status:")
-    print(f"  cloakbrowser: {'[OK] available' if _CLOAK_OK else '[--] not installed  (pip install -r requirements.txt && python -m cloakbrowser install)'}")
-    print(f"  camoufox  : {'[OK] available' if _CAMOUFOX_OK  else '[--] not installed  (pip install camoufox && camoufox fetch)'}")
-    print(f"  playwright: {'[OK] available' if _PLAYWRIGHT_OK else '[--] not installed  (pip install playwright && playwright install chromium)'}")
+    print(f"  cloakbrowser: {'[OK] available' if _CLOAK_OK else '[--] not installed  (pip install -r requirements-browser.txt && python -m cloakbrowser install)'}")
+    print(f"  camoufox  : {'[OK] available' if _CAMOUFOX_OK  else '[--] not installed  (pip install -r requirements-browser.txt && python -m camoufox fetch)'}")
+    print(f"  playwright: {'[OK] available' if _PLAYWRIGHT_OK else '[--] not installed  (pip install -r requirements-browser.txt && playwright install chromium)'}")
 
 
 def _run_async(coro):
-    """Run an async coroutine. Playwright requires ProactorEventLoop on Windows for subprocess support."""
-    return asyncio.run(coro)
+    """Run an async coroutine using the project's event loop factory.
+    Uses SelectorEventLoop on Windows (required for Playwright subprocess support).
+    """
+    from proxy_core import run_async_entrypoint
+    return run_async_entrypoint(coro)
 
 
 def main() -> None:
@@ -769,7 +794,14 @@ def main() -> None:
         print("\nRunning self-test (no proxy)...")
 
         async def _run_tests():
-            return await scrape_many(test_urls, concurrency=1, proxy_url=None, headless=True, engine=args.engine)
+            return await scrape_many(
+                test_urls,
+                concurrency=1,
+                proxy_url=None,
+                headless=True,
+                engine=args.engine,
+                ignore_https_errors=args.ignore_https_errors,
+            )
 
         results = _run_async(_run_tests())
         for r in results:
@@ -793,6 +825,7 @@ def main() -> None:
         wait_extra_ms=args.wait,
         screenshot=args.screenshot,
         engine=args.engine,
+        ignore_https_errors=args.ignore_https_errors,
     ))
 
     if args.output and result.get("content"):
